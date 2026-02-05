@@ -1,0 +1,11 @@
+streamlit
+pandas
+beautifulsoup4
+selenium
+webdriver-manager
+openpyxl
+plotly
+xlsxwriter
+yfinance
+scipy
+pdfplumber
