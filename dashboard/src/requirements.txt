@@ -11,3 +11,6 @@ scipy
 pdfplumber
 plotly==6.5.2
 matplotlib
+chronos-forecasting>=2.0
+toto-ts
+torch

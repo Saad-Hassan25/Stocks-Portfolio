@@ -6,8 +6,16 @@ Extracts: Stock Symbol, Quantity, Price, Transaction Type (Buy/Sell), Date, Fees
 """
 
 import re
+import logging
+import warnings
+import os
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
+
+# Suppress PDF parsing warnings
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
+logging.getLogger('pdfplumber').setLevel(logging.ERROR)
+warnings.filterwarnings('ignore')
 
 # Try importing PDF libraries
 try:
@@ -37,27 +45,49 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 def _extract_with_pdfplumber(pdf_path: str) -> str:
     """Extract text using pdfplumber (better for tables)."""
     import pdfplumber
+    import warnings
     
     text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    try:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                    except:
+                        continue
+        except Exception as e:
+            # Try PyPDF2 as fallback
+            try:
+                text = _extract_with_pypdf2(pdf_path)
+            except:
+                pass
     return text
 
 
 def _extract_with_pypdf2(pdf_path: str) -> str:
     """Extract text using PyPDF2."""
-    import PyPDF2
+    try:
+        import PyPDF2
+    except ImportError:
+        return ""
     
     text = ""
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                try:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+                except:
+                    continue
+    except:
+        pass
     return text
 
 
@@ -70,13 +100,22 @@ def extract_tables_from_pdf(pdf_path: str) -> List[List[List[str]]]:
         return []
     
     import pdfplumber
+    import warnings
     
     tables = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_tables = page.extract_tables()
-            if page_tables:
-                tables.extend(page_tables)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    try:
+                        page_tables = page.extract_tables()
+                        if page_tables:
+                            tables.extend(page_tables)
+                    except:
+                        continue
+        except:
+            pass
     return tables
 
 
@@ -327,9 +366,9 @@ def _parse_transactions_from_text(text: str) -> List[Dict]:
     purchase_pos = -1
     sale_pos = -1
     
-    # Look for section markers
-    purchase_markers = ['purchase order', 'your purchase', 'bought']
-    sale_markers = ['sale order', 'your sale', 'sold']
+    # Look for section markers - expanded for JSBL
+    purchase_markers = ['purchase order', 'your purchase', 'bought', 'purchase', 'buy order']
+    sale_markers = ['sale order', 'your sale', 'sold', 'sale', 'sell order']
     
     for marker in purchase_markers:
         pos = text_lower.find(marker)
@@ -341,64 +380,100 @@ def _parse_transactions_from_text(text: str) -> List[Dict]:
         if pos != -1 and (sale_pos == -1 or pos < sale_pos):
             sale_pos = pos
     
-    # JSBL specific format pattern (extended to capture date and fees):
-    # Contract# Ready DD-MM-YY SYMBOL QTY RATE BROK.RATE BROK.AMT NET.RATE SST LEVIES AMOUNT
-    # Example: 00115943 Ready 13-01-26 LUCK 2 507.7400 1.0155 2.03 508.7555 0.30 0.12 1,017.94
-    # Groups: 1=Date, 2=Symbol, 3=Qty, 4=Rate, 5=BrokAmt, 6=SST, 7=Levies
-    jsbl_pattern = r'\d{8}\s+Ready\s+(\d{2}-\d{2}-\d{2})\s+([A-Z]+)\s+(\d+)\s+([\d.]+)\s+[\d.]+\s+([\d.]+)\s+[\d.]+\s+([\d.]+)\s+([\d.]+)'
+    # Try multiple JSBL patterns
+    jsbl_patterns = [
+        # Pattern 1: Full JSBL format with all fees
+        # Contract# Ready DD-MM-YY SYMBOL QTY RATE BROK.RATE BROK.AMT NET.RATE SST LEVIES AMOUNT
+        r'\d{8}\s+Ready\s+(\d{2}-\d{2}-\d{2})\s+([A-Z]+(?:-[A-Z]+)?)\s+(\d+)\s+([\d,]+\.?\d*)\s+[\d,]+\.?\d*\s+([\d,]+\.?\d*)\s+[\d,]+\.?\d*\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
+        
+        # Pattern 2: Simpler pattern - just main columns
+        # Contract# Ready DD-MM-YY SYMBOL QTY RATE ... AMOUNT
+        r'\d{6,8}\s+Ready\s+(\d{2}-\d{2}-\d{2})\s+([A-Z]{2,10})\s+(\d+)\s+([\d,]+\.?\d*)',
+        
+        # Pattern 3: Without "Ready" keyword
+        r'(\d{2}-\d{2}-\d{2})\s+([A-Z]{2,10})\s+(\d+)\s+([\d,]+\.?\d*)\s+[\d,.]+\s+([\d,]+\.?\d*)',
+        
+        # Pattern 4: Just symbol, qty, rate from table-like structure
+        r'([A-Z]{2,10})\s+(\d+)\s+([\d,]+\.\d{2,4})\s+[\d,.]+\s+[\d,.]+\s+([\d,]+\.\d{2})',
+    ]
     
-    # Use finditer to get positions along with matches
-    for match in re.finditer(jsbl_pattern, text):
-        try:
-            match_pos = match.start()
-            sett_date = match.group(1)  # DD-MM-YY format
-            symbol = match.group(2).upper()
-            quantity = int(match.group(3))
-            price = float(match.group(4))
-            brok_amt = float(match.group(5))
-            sst = float(match.group(6))
-            levies = float(match.group(7))
-            total_fees = brok_amt + sst + levies
-            
-            # Convert date from DD-MM-YY to YYYY-MM-DD
+    for pattern_idx, jsbl_pattern in enumerate(jsbl_patterns):
+        # Use finditer to get positions along with matches
+        for match in re.finditer(jsbl_pattern, text, re.IGNORECASE):
             try:
-                date_parts = sett_date.split('-')
-                year = int(date_parts[2])
-                year = 2000 + year if year < 100 else year
-                formatted_date = f"{year}-{date_parts[1]}-{date_parts[0]}"
-            except:
+                match_pos = match.start()
+                
+                if pattern_idx == 0:
+                    # Full pattern with fees
+                    sett_date = match.group(1)
+                    symbol = match.group(2).upper().replace('-', '')
+                    quantity = int(match.group(3))
+                    price = float(match.group(4).replace(',', ''))
+                    brok_amt = float(match.group(5).replace(',', ''))
+                    sst = float(match.group(6).replace(',', ''))
+                    levies = float(match.group(7).replace(',', ''))
+                    total_fees = brok_amt + sst + levies
+                elif pattern_idx == 1:
+                    # Simpler pattern
+                    sett_date = match.group(1)
+                    symbol = match.group(2).upper()
+                    quantity = int(match.group(3))
+                    price = float(match.group(4).replace(',', ''))
+                    total_fees = 0
+                elif pattern_idx == 2:
+                    # Without Ready
+                    sett_date = match.group(1)
+                    symbol = match.group(2).upper()
+                    quantity = int(match.group(3))
+                    price = float(match.group(4).replace(',', ''))
+                    total_fees = float(match.group(5).replace(',', '')) if len(match.groups()) > 4 else 0
+                else:
+                    # Pattern 4 - no date
+                    sett_date = None
+                    symbol = match.group(1).upper()
+                    quantity = int(match.group(2))
+                    price = float(match.group(3).replace(',', ''))
+                    total_fees = 0
+                
+                # Convert date from DD-MM-YY to YYYY-MM-DD
                 formatted_date = None
-            
-            # Determine transaction type based on position relative to section headers
-            trans_type = 'BUY'  # Default
-            if purchase_pos != -1 and sale_pos != -1:
-                # Both sections exist - check which section this transaction is in
-                if match_pos > sale_pos:
+                if sett_date:
+                    try:
+                        date_parts = sett_date.split('-')
+                        year = int(date_parts[2])
+                        year = 2000 + year if year < 100 else year
+                        formatted_date = f"{year}-{date_parts[1]}-{date_parts[0]}"
+                    except:
+                        pass
+                
+                # Determine transaction type based on position relative to section headers
+                trans_type = 'BUY'  # Default
+                if purchase_pos != -1 and sale_pos != -1:
+                    if sale_pos > purchase_pos:
+                        trans_type = 'SELL' if match_pos > sale_pos else 'BUY'
+                    else:
+                        trans_type = 'BUY' if match_pos > purchase_pos else 'SELL'
+                elif sale_pos != -1 and match_pos > sale_pos:
                     trans_type = 'SELL'
-                elif match_pos > purchase_pos:
+                elif purchase_pos != -1 and match_pos > purchase_pos:
                     trans_type = 'BUY'
-            elif sale_pos != -1 and match_pos > sale_pos:
-                # Only sale section found
-                trans_type = 'SELL'
-            elif purchase_pos != -1 and match_pos > purchase_pos:
-                # Only purchase section found
-                trans_type = 'BUY'
-            
-            if quantity > 0 and price > 0:
-                transactions.append({
-                    'symbol': symbol,
-                    'quantity': quantity,
-                    'price': price,
-                    'amount': quantity * price,
-                    'type': trans_type,
-                    'date': formatted_date,
-                    'fees': total_fees,
-                    'brokerage': brok_amt,
-                    'sst': sst,
-                    'levies': levies
-                })
-        except (ValueError, IndexError):
-            continue
+                
+                if quantity > 0 and price > 0 and len(symbol) >= 2:
+                    transactions.append({
+                        'symbol': symbol,
+                        'quantity': quantity,
+                        'price': price,
+                        'amount': quantity * price,
+                        'type': trans_type,
+                        'date': formatted_date,
+                        'fees': total_fees
+                    })
+            except (ValueError, IndexError):
+                continue
+        
+        # If we found transactions with this pattern, stop trying others
+        if transactions:
+            break
     
     # If JSBL pattern didn't work, try generic patterns
     if not transactions:

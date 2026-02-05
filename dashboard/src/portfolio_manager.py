@@ -5,7 +5,8 @@ from market_data import get_current_price, get_historical_price
 from data_loader import load_data_from_file
 
 class PortfolioManager:
-    def __init__(self):
+    def __init__(self, user_id=0):
+        self.user_id = user_id
         self.scraped_prices = self._load_scraped_prices()
 
     def _load_scraped_prices(self):
@@ -47,7 +48,7 @@ class PortfolioManager:
         return get_current_price(symbol)
 
     def get_portfolio_summary(self):
-        transactions = get_transactions()
+        transactions = get_transactions(self.user_id)
         
         if transactions.empty:
             return pd.DataFrame(), {}
@@ -129,7 +130,7 @@ class PortfolioManager:
     # ================= DIVIDEND TRACKING =================
     def get_dividend_summary(self):
         """Get dividend summary by stock."""
-        dividends = get_dividends()
+        dividends = get_dividends(self.user_id)
         
         if dividends.empty:
             return pd.DataFrame(), 0
@@ -167,7 +168,7 @@ class PortfolioManager:
         Calculate and record realized P&L when selling.
         Uses weighted average cost basis.
         """
-        transactions = get_transactions()
+        transactions = get_transactions(self.user_id)
         stock_tx = transactions[transactions['symbol'] == symbol]
         
         # Calculate average cost
@@ -187,14 +188,14 @@ class PortfolioManager:
         if quantity > 0:
             avg_cost = total_cost / quantity
             # Record the realized P&L
-            add_realized_pnl(symbol, sell_date, sell_quantity, avg_cost, sell_price, fees)
+            add_realized_pnl(symbol, sell_date, sell_quantity, avg_cost, sell_price, fees, self.user_id)
             return (sell_price - avg_cost) * sell_quantity - fees
         
         return 0
 
     def get_realized_pnl_summary(self):
         """Get realized P&L summary."""
-        realized = get_realized_pnl()
+        realized = get_realized_pnl(self.user_id)
         
         if realized.empty:
             return pd.DataFrame(), 0, 0, 0

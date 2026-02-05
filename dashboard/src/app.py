@@ -4,7 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Existing modules
 from scraper import fetch_all_data
@@ -20,23 +20,112 @@ from market_data import get_historical_price, get_current_price, get_stock_chart
 from portfolio_manager import PortfolioManager
 from advanced_indicators import SupportResistanceDetector, PatternRecognizer, add_support_resistance_to_df
 from pdf_parser import parse_pdf_bytes
+from auth import register_user, login_user, get_user_by_id, change_password
+from forecasting import forecast_stock_price, get_forecast_summary, is_model_available, get_available_models
 
 st.set_page_config(page_title="PSX Portfolio Manager", layout="wide")
 
+# ================= AUTHENTICATION =================
+def init_session_state():
+    """Initialize session state variables for authentication."""
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = None
+    if 'username' not in st.session_state:
+        st.session_state.username = None
+
+def render_login_page():
+    """Render the login/signup page."""
+    st.title("🔐 PSX Portfolio Manager")
+    st.markdown("### Welcome! Please login or create an account.")
+    
+    tab_login, tab_signup = st.tabs(["🔑 Login", "📝 Sign Up"])
+    
+    with tab_login:
+        st.subheader("Login to Your Account")
+        with st.form("login_form"):
+            login_user_input = st.text_input("Username or Email", key="login_username")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            login_submitted = st.form_submit_button("Login", type="primary")
+            
+            if login_submitted:
+                if login_user_input and login_password:
+                    result = login_user(login_user_input, login_password)
+                    if result['success']:
+                        st.session_state.logged_in = True
+                        st.session_state.user_id = result['user_id']
+                        st.session_state.username = result['username']
+                        st.success(f"Welcome back, {result['username']}!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(result['message'])
+                else:
+                    st.error("Please enter username/email and password.")
+    
+    with tab_signup:
+        st.subheader("Create New Account")
+        with st.form("signup_form"):
+            signup_username = st.text_input("Username (min 3 characters)", key="signup_username")
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input("Password (min 6 characters)", type="password", key="signup_password")
+            signup_confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            signup_submitted = st.form_submit_button("Create Account", type="primary")
+            
+            if signup_submitted:
+                if not signup_username or not signup_email or not signup_password:
+                    st.error("Please fill in all fields.")
+                elif signup_password != signup_confirm:
+                    st.error("Passwords do not match.")
+                elif '@' not in signup_email:
+                    st.error("Please enter a valid email address.")
+                else:
+                    result = register_user(signup_username, signup_email, signup_password)
+                    if result['success']:
+                        st.success("Account created successfully! Please login.")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(result['message'])
+
+def render_user_sidebar():
+    """Render user info and logout in sidebar."""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown(f"👤 **{st.session_state.username}**")
+    if st.sidebar.button("🚪 Logout", key="logout_btn"):
+        st.session_state.logged_in = False
+        st.session_state.user_id = None
+        st.session_state.username = None
+        st.rerun()
+
+# Initialize session state
+init_session_state()
+
+# Check if user is logged in
+if not st.session_state.logged_in:
+    render_login_page()
+    st.stop()
+
+# Get current user ID for all operations
+current_user_id = st.session_state.user_id
+
 # ================= NAVIGATION =================
 st.sidebar.title("PSX Manager")
+render_user_sidebar()
 page = st.sidebar.radio("Navigate", ["Portfolio Tracker", "📈 Stock Explorer", "Investment Planner"])
 
 # ================= PORTFOLIO TRACKER (NEW) =================
 def render_portfolio_tracker():
     st.header("My Portfolio Tracker")    
     # --- Metrics Section ---
-    pm = PortfolioManager()
+    user_id = st.session_state.user_id
+    pm = PortfolioManager(user_id)
     df_holdings, metrics = pm.get_portfolio_summary()
     
     # Get additional metrics
-    total_dividends = get_total_dividends()
-    total_realized = get_total_realized_pnl()
+    total_dividends = get_total_dividends(user_id)
+    total_realized = get_total_realized_pnl(user_id)
     
     if not df_holdings.empty:
         # Row 1: Main metrics
@@ -91,7 +180,7 @@ def render_portfolio_tracker():
                                 st.warning(f"Could not fetch price for {symbol} on {date}. Please enter manually.")
                                 st.stop()
                     
-                    add_transaction(symbol, date.strftime('%Y-%m-%d'), quantity_input, final_price, trans_type, fees_input)
+                    add_transaction(symbol, date.strftime('%Y-%m-%d'), quantity_input, final_price, trans_type, fees_input, user_id)
                     st.success(f"Transaction added: {trans_type} {quantity_input} {symbol} @ {final_price}")
                     time.sleep(1) 
                     st.rerun()
@@ -115,27 +204,30 @@ def render_portfolio_tracker():
                 if not div_symbol or div_amount <= 0:
                     st.error("Please enter valid symbol and amount.")
                 else:
-                    add_dividend(div_symbol, div_date.strftime('%Y-%m-%d'), div_amount, div_shares, div_type)
+                    add_dividend(div_symbol, div_date.strftime('%Y-%m-%d'), div_amount, div_shares, div_type, user_id)
                     st.success(f"Dividend recorded: {div_symbol} - PKR {div_amount * div_shares:,.2f}")
                     time.sleep(1)
                     st.rerun()
 
-    # --- PDF Contract Upload ---
-    with st.expander("📄 Import from PDF Contract"):
+    # --- PDF Contract Upload (Single File - Original) ---
+    with st.expander("📄 Import from PDF Contract (Single)"):
         st.subheader("Upload Broker Contract PDF")
         st.caption("Upload your broker's contract note (JSBL, etc.) to automatically extract and import transactions.")
         
         pdf_col1, pdf_col2 = st.columns([3, 1])
         with pdf_col1:
-            uploaded_pdf = st.file_uploader("Choose a PDF file", type=['pdf'], key="pdf_uploader")
+            uploaded_pdf = st.file_uploader("Choose a PDF file", type=['pdf'], key="pdf_uploader_single")
         with pdf_col2:
-            consolidate_trans = st.checkbox("Consolidate same symbols", value=True, key="pdf_consolidate",
+            consolidate_single = st.checkbox("Consolidate same symbols", value=True, key="pdf_consolidate_single",
                                             help="Combine multiple trades of the same stock into one (weighted average price)")
         
         if uploaded_pdf is not None:
+            # Get bytes from uploaded file
+            pdf_bytes = uploaded_pdf.getvalue()
+            
             # Parse the PDF
             with st.spinner("Parsing PDF..."):
-                pdf_result = parse_pdf_bytes(uploaded_pdf.read(), uploaded_pdf.name, consolidate=consolidate_trans)
+                pdf_result = parse_pdf_bytes(pdf_bytes, uploaded_pdf.name, consolidate=consolidate_single)
             
             if pdf_result.get('success') and pdf_result.get('transactions'):
                 st.success(f"✅ Found {len(pdf_result['transactions'])} transaction(s) in the contract")
@@ -186,7 +278,7 @@ def render_portfolio_tracker():
                     },
                     hide_index=True,
                     use_container_width=True,
-                    key="pdf_trans_editor"
+                    key="pdf_trans_editor_single"
                 )
                 
                 # Show total fees summary
@@ -203,7 +295,7 @@ def render_portfolio_tracker():
                             fee_cols[i % 4].metric(fee_name.replace('_', ' ').title(), f"PKR {amount:,.2f}")
                 
                 # Import button
-                if st.button("✅ Import Selected Transactions", type="primary", key="pdf_import_btn"):
+                if st.button("✅ Import Selected Transactions", type="primary", key="pdf_import_btn_single"):
                     import_count = 0
                     for _, row in edited_df.iterrows():
                         if row['Import'] and row['symbol'] and row['quantity'] > 0 and row['price'] > 0:
@@ -217,7 +309,8 @@ def render_portfolio_tracker():
                                 quantity=int(row['quantity']),
                                 price=float(row['price']),
                                 type=row['type'],
-                                fees=trans_fees
+                                fees=trans_fees,
+                                user_id=user_id
                             )
                             import_count += 1
                     
@@ -243,13 +336,244 @@ def render_portfolio_tracker():
                 st.error(f"Failed to parse PDF: {pdf_result.get('error', 'Unknown error')}")
                 st.info("Make sure you have `pdfplumber` installed: `pip install pdfplumber`")
 
+    # --- PDF Contract Upload (Bulk Import) ---
+    with st.expander("📄 Bulk Import from PDF Contracts (Multiple Files)"):
+        st.subheader("Upload Multiple Broker Contract PDFs")
+        st.caption("Upload up to 15 broker contract notes (JSBL, etc.) to automatically extract and import transactions in bulk.")
+        
+        pdf_col1, pdf_col2 = st.columns([3, 1])
+        with pdf_col1:
+            uploaded_pdfs = st.file_uploader(
+                "Choose PDF files (max 15)", 
+                type=['pdf'], 
+                key="pdf_uploader_bulk",
+                accept_multiple_files=True
+            )
+        with pdf_col2:
+            consolidate_trans = st.checkbox("Consolidate same symbols", value=True, key="pdf_consolidate",
+                                            help="Combine multiple trades of the same stock into one (weighted average price)")
+            consolidate_across_pdfs = st.checkbox("Consolidate across all PDFs", value=False, key="pdf_consolidate_all",
+                                            help="Combine same symbols from different PDFs (uses weighted average)")
+        
+        if uploaded_pdfs:
+            # Limit to 15 PDFs
+            if len(uploaded_pdfs) > 15:
+                st.warning(f"⚠️ Maximum 15 PDFs allowed. Only the first 15 will be processed.")
+                uploaded_pdfs = uploaded_pdfs[:15]
+            
+            st.info(f"📁 **{len(uploaded_pdfs)} PDF(s) selected for import**")
+            
+            # Parse all PDFs
+            all_transactions = []
+            all_fees_summary = {}
+            pdf_summaries = []
+            failed_pdfs = []
+            
+            with st.spinner(f"Parsing {len(uploaded_pdfs)} PDF(s)..."):
+                for pdf_file in uploaded_pdfs:
+                    try:
+                        # Use getvalue() to properly get bytes from UploadedFile
+                        pdf_bytes = pdf_file.getvalue()
+                        pdf_result = parse_pdf_bytes(pdf_bytes, pdf_file.name, consolidate=consolidate_trans)
+                        
+                        if pdf_result.get('success') and pdf_result.get('transactions'):
+                            # Add source filename to each transaction for tracking
+                            for trans in pdf_result['transactions']:
+                                trans['source_file'] = pdf_file.name
+                                # Ensure all required fields exist
+                                if 'date' not in trans or not trans['date']:
+                                    trans['date'] = pdf_result.get('trade_date', datetime.today().strftime('%Y-%m-%d'))
+                                if 'fees' not in trans:
+                                    trans['fees'] = 0
+                                if 'type' not in trans:
+                                    trans['type'] = 'BUY'
+                            
+                            all_transactions.extend(pdf_result['transactions'])
+                            
+                            # Track PDF summary
+                            pdf_summaries.append({
+                                'filename': pdf_file.name,
+                                'contract_number': pdf_result.get('contract_number', 'N/A'),
+                                'trade_date': pdf_result.get('trade_date', 'N/A'),
+                                'transactions': len(pdf_result['transactions']),
+                                'buy_count': sum(1 for t in pdf_result['transactions'] if t.get('type') == 'BUY'),
+                                'sell_count': sum(1 for t in pdf_result['transactions'] if t.get('type') == 'SELL'),
+                                'total_fees': sum(t.get('fees', 0) for t in pdf_result['transactions'])
+                            })
+                            
+                            # Aggregate fees from PDF headers
+                            for fee_name, amount in pdf_result.get('fees', {}).items():
+                                all_fees_summary[fee_name] = all_fees_summary.get(fee_name, 0) + amount
+                        else:
+                            failed_pdfs.append({
+                                'filename': pdf_file.name,
+                                'error': pdf_result.get('error', 'No transactions found')
+                            })
+                    except Exception as e:
+                        failed_pdfs.append({
+                            'filename': pdf_file.name,
+                            'error': str(e)
+                        })
+            
+            # Show parsing summary
+            if pdf_summaries:
+                st.success(f"✅ Successfully parsed {len(pdf_summaries)} PDF(s) with {len(all_transactions)} total transaction(s)")
+                
+                # Show summary table of parsed PDFs
+                with st.expander("📊 PDF Parsing Summary", expanded=True):
+                    summary_df = pd.DataFrame(pdf_summaries)
+                    summary_df.columns = ['File', 'Contract #', 'Trade Date', 'Transactions', 'Buys', 'Sells', 'Fees']
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                    
+                    # Totals
+                    total_buys = sum(s['buy_count'] for s in pdf_summaries)
+                    total_sells = sum(s['sell_count'] for s in pdf_summaries)
+                    total_trans_fees = sum(s['total_fees'] for s in pdf_summaries)
+                    
+                    tc1, tc2, tc3, tc4 = st.columns(4)
+                    tc1.metric("Total Transactions", len(all_transactions))
+                    tc2.metric("Total Buys", total_buys)
+                    tc3.metric("Total Sells", total_sells)
+                    tc4.metric("Total Fees", f"PKR {total_trans_fees:,.2f}")
+            
+            # Show failed PDFs
+            if failed_pdfs:
+                with st.expander(f"❌ Failed to parse {len(failed_pdfs)} PDF(s)", expanded=False):
+                    for fp in failed_pdfs:
+                        st.error(f"**{fp['filename']}**: {fp['error']}")
+            
+            # Process transactions if any were found
+            if all_transactions:
+                # Consolidate across PDFs if requested
+                if consolidate_across_pdfs:
+                    all_transactions = _consolidate_transactions_across_pdfs(all_transactions)
+                    st.info(f"📦 After consolidation: {len(all_transactions)} unique stock transactions")
+                
+                # Create editable dataframe for validation
+                st.markdown("#### 📋 All Extracted Transactions (Review & Edit)")
+                st.caption("Edit any incorrect values before importing. Uncheck 'Import' for transactions you want to skip.")
+                
+                # Convert to DataFrame for editing
+                trans_df = pd.DataFrame(all_transactions)
+                trans_df['Import'] = True  # Checkbox column
+                
+                # Ensure all columns exist
+                for col in ['symbol', 'quantity', 'price', 'amount', 'type', 'date', 'fees', 'source_file']:
+                    if col not in trans_df.columns:
+                        if col == 'date':
+                            trans_df[col] = datetime.today().strftime('%Y-%m-%d')
+                        elif col in ['symbol', 'type', 'source_file']:
+                            trans_df[col] = ''
+                        else:
+                            trans_df[col] = 0
+                
+                # Fill any None dates with today's date
+                trans_df['date'] = trans_df['date'].fillna(datetime.today().strftime('%Y-%m-%d'))
+                trans_df['fees'] = trans_df['fees'].fillna(0)
+                
+                # Reorder columns - put source_file at the end for reference
+                display_cols = ['Import', 'type', 'symbol', 'quantity', 'price', 'amount', 'date', 'fees', 'source_file']
+                trans_df = trans_df[[c for c in display_cols if c in trans_df.columns]]
+                
+                # Use data editor for validation
+                edited_df = st.data_editor(
+                    trans_df,
+                    column_config={
+                        "Import": st.column_config.CheckboxColumn("Import", default=True),
+                        "type": st.column_config.SelectboxColumn("Type", options=["BUY", "SELL"], required=True),
+                        "symbol": st.column_config.TextColumn("Symbol", required=True),
+                        "quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
+                        "price": st.column_config.NumberColumn("Price (PKR)", min_value=0.01, format="%.2f", required=True),
+                        "amount": st.column_config.NumberColumn("Amount (PKR)", format="%.2f", disabled=True),
+                        "date": st.column_config.TextColumn("Trade Date", required=True),
+                        "fees": st.column_config.NumberColumn("Fees (PKR)", min_value=0, format="%.2f"),
+                        "source_file": st.column_config.TextColumn("Source PDF", disabled=True),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key="pdf_trans_editor_bulk",
+                    height=400
+                )
+                
+                # Show summary of selected transactions
+                selected_df = edited_df[edited_df['Import']]
+                buy_selected = len(selected_df[selected_df['type'] == 'BUY'])
+                sell_selected = len(selected_df[selected_df['type'] == 'SELL'])
+                total_fees_sum = selected_df['fees'].sum()
+                
+                st.markdown("---")
+                sum_c1, sum_c2, sum_c3, sum_c4 = st.columns(4)
+                sum_c1.metric("Selected for Import", f"{len(selected_df)} / {len(edited_df)}")
+                sum_c2.metric("Buy Transactions", buy_selected)
+                sum_c3.metric("Sell Transactions", sell_selected)
+                sum_c4.metric("Total Fees", f"PKR {total_fees_sum:,.2f}")
+                
+                # Show aggregated fees from PDF headers
+                if all_fees_summary:
+                    with st.expander("📊 Aggregated Fees Summary from All PDFs"):
+                        fee_cols = st.columns(4)
+                        fee_items = list(all_fees_summary.items())
+                        for i, (fee_name, amount) in enumerate(fee_items):
+                            fee_cols[i % 4].metric(fee_name.replace('_', ' ').title(), f"PKR {amount:,.2f}")
+                
+                # Import button
+                col_import, col_clear = st.columns([1, 1])
+                with col_import:
+                    if st.button("✅ Import All Selected Transactions", type="primary", key="pdf_import_btn_bulk"):
+                        import_count = 0
+                        buy_count = 0
+                        sell_count = 0
+                        total_fees_imported = 0
+                        
+                        for _, row in edited_df.iterrows():
+                            if row['Import'] and row['symbol'] and row['quantity'] > 0 and row['price'] > 0:
+                                # Use per-transaction date and fees from the dataframe
+                                trans_date = row['date'] if pd.notna(row['date']) else datetime.today().strftime('%Y-%m-%d')
+                                trans_fees = float(row['fees']) if pd.notna(row['fees']) else 0
+                                trans_type = row['type'] if row['type'] in ['BUY', 'SELL'] else 'BUY'
+                                
+                                add_transaction(
+                                    symbol=row['symbol'].upper().strip(),
+                                    date=trans_date,
+                                    quantity=int(row['quantity']),
+                                    price=float(row['price']),
+                                    type=trans_type,
+                                    fees=trans_fees,
+                                    user_id=user_id
+                                )
+                                import_count += 1
+                                total_fees_imported += trans_fees
+                                if trans_type == 'BUY':
+                                    buy_count += 1
+                                else:
+                                    sell_count += 1
+                        
+                        if import_count > 0:
+                            st.success(f"""
+                            🎉 **Successfully imported {import_count} transaction(s)!**
+                            - 📈 **{buy_count}** Buy transactions
+                            - 📉 **{sell_count}** Sell transactions  
+                            - 💰 **PKR {total_fees_imported:,.2f}** in fees recorded
+                            """)
+                            time.sleep(2)
+                            st.rerun()
+                        else:
+                            st.warning("No valid transactions selected for import.")
+                
+                with col_clear:
+                    if st.button("🗑️ Clear Selection", key="pdf_clear_btn"):
+                        st.rerun()
+                
+            elif not failed_pdfs:
+                st.warning("No transactions found in any of the uploaded PDFs.")
+
     # --- Clear Portfolio (Danger Zone) ---
     with st.expander("⚠️ Danger Zone", expanded=False):
         st.markdown("### 🗑️ Clear Entire Portfolio")
         st.warning("**WARNING:** This will permanently delete ALL your portfolio data including transactions, dividends, and realized P&L records. This action cannot be undone!")
         
         # Show current stats
-        stats = get_portfolio_stats()
+        stats = get_portfolio_stats(user_id)
         if stats['total'] > 0:
             st.markdown(f"""
             **Data that will be deleted:**
@@ -282,7 +606,7 @@ def render_portfolio_tracker():
                     col_btn1, col_btn2 = st.columns(2)
                     with col_btn1:
                         if st.button("🗑️ DELETE EVERYTHING", type="primary", key="clear_portfolio_btn"):
-                            clear_all_portfolio_data()
+                            clear_all_portfolio_data(user_id)
                             st.session_state.clear_confirm_1 = False
                             st.session_state.clear_confirm_2 = False
                             st.success("✅ Portfolio cleared successfully!")
@@ -326,7 +650,7 @@ def render_portfolio_tracker():
             
             # Transaction History with Delete functionality
             st.markdown("### Transaction History")
-            transactions = get_transactions()
+            transactions = get_transactions(user_id)
             
             if not transactions.empty:
                 t_col1, t_col2 = st.columns([3, 1])
@@ -342,11 +666,11 @@ def render_portfolio_tracker():
                     del_id = st.number_input("Transaction ID to Delete", min_value=0, step=1)
                     if st.button("Delete Transaction", type="primary"):
                         if del_id > 0:
-                             delete_transaction(del_id)
+                             delete_transaction(del_id, user_id)
                              st.success(f"Deleted transaction {del_id}")
                              time.sleep(1)
                              st.rerun()
-        
+
         with tab2:
             st.subheader("📊 Portfolio Visual Analysis")
             
@@ -418,7 +742,7 @@ def render_portfolio_tracker():
             
             st.divider()
             
-            # Row 4: Weight Distribution & Top/Bottom Performers
+            # Row 4: Weight Distribution & Performance Summary
             c7, c8 = st.columns(2)
             with c7:
                 st.markdown("##### Portfolio Weight Distribution")
@@ -433,7 +757,6 @@ def render_portfolio_tracker():
             
             with c8:
                 st.markdown("##### Performance Summary")
-                # Top and Bottom performers
                 if len(df_holdings) >= 2:
                     top_performer = df_holdings.loc[df_holdings['Return %'].idxmax()]
                     bottom_performer = df_holdings.loc[df_holdings['Return %'].idxmin()]
@@ -449,7 +772,6 @@ def render_portfolio_tracker():
                                   delta=f"{bottom_performer['Return %']:.2f}%", delta_color=delta_color)
                         st.caption(f"P&L: PKR {bottom_performer['Gain/Loss']:,.0f}")
                     
-                    # Stats
                     st.divider()
                     avg_return = df_holdings['Return %'].mean()
                     positive_stocks = len(df_holdings[df_holdings['Gain/Loss'] > 0])
@@ -461,20 +783,62 @@ def render_portfolio_tracker():
         # --- TAB 3: STOCK CHARTS WITH TECHNICAL INDICATORS ---
         with tab3:
             st.subheader("Stock Price Charts with Technical Indicators")
-            st.caption("Select a stock to view its historical price trend with RSI, MACD, and Bollinger Bands.")
+            st.caption("Select a stock to view its historical price trend with RSI, MACD, Bollinger Bands, and Advanced Analysis.")
             
-            # Stock selector
+            # Help expander with indicator explanations
+            with st.expander("📚 What do these indicators mean? (Click to learn)"):
+                help_col1, help_col2 = st.columns(2)
+                with help_col1:
+                    st.markdown("""
+                    **📊 RSI (Relative Strength Index)**
+                    - Measures momentum on a scale of 0-100
+                    - **Above 70** = Overbought (price may fall soon)
+                    - **Below 30** = Oversold (price may rise soon)
+                    - **30-70** = Neutral zone
+                    
+                    **📈 Bollinger Bands**
+                    - 3 lines around price: Middle (20-day avg), Upper & Lower bands
+                    - Bands **widen** during high volatility, **narrow** during calm
+                    - Price near **upper band** = potentially overbought
+                    - Price near **lower band** = potentially oversold
+                    
+                    **📉 MACD (Moving Average Convergence Divergence)**
+                    - Shows trend direction and momentum
+                    - **MACD above Signal** = Bullish momentum 📈
+                    - **MACD below Signal** = Bearish momentum 📉
+                    """)
+                with help_col2:
+                    st.markdown("""
+                    **🔴🟢 Support/Resistance Zones**
+                    - **Support (Green)**: Price level where buying pressure is strong - price tends to bounce UP from here
+                    - **Resistance (Red)**: Price level where selling pressure is strong - price tends to fall back from here
+                    - More "touches" = stronger level
+                    
+                    **🎯 Pattern Recognition**
+                    - **Double Bottom (W shape)**: Bullish reversal - price may go UP
+                    - **Double Top (M shape)**: Bearish reversal - price may go DOWN
+                    - **Head & Shoulders**: Bearish reversal pattern
+                    - **Inverse H&S**: Bullish reversal pattern
+                    - **Higher Highs/Lows**: Uptrend continuation
+                    - **Lower Highs/Lows**: Downtrend continuation
+                    """)
+            
             stock_list = df_holdings['Stock'].tolist()
             
-            col_select, col_period, col_indicators = st.columns([2, 1, 1])
+            col_select, col_period = st.columns([2, 1])
             with col_select:
                 selected_stock = st.selectbox("Select Stock", stock_list, key="chart_stock_select")
             with col_period:
                 period_options = {"1 Month": "1mo", "3 Months": "3mo", "6 Months": "6mo", "1 Year": "1y", "2 Years": "2y", "5 Years": "5y"}
                 selected_period_label = st.selectbox("Time Period", list(period_options.keys()), index=2, key="chart_period_select")
                 selected_period = period_options[selected_period_label]
+            
+            # Indicators and Advanced Analysis row
+            col_indicators, col_advanced = st.columns(2)
             with col_indicators:
-                show_indicators = st.multiselect("Indicators", ["Bollinger Bands", "RSI", "MACD"], default=["RSI"], key="chart_indicators")
+                show_indicators = st.multiselect("Technical Indicators", ["Bollinger Bands", "RSI", "MACD"], default=["RSI"], key="chart_indicators")
+            with col_advanced:
+                show_advanced = st.multiselect("Advanced Analysis", ["Support/Resistance Zones", "Pattern Recognition"], default=[], key="chart_advanced")
             
             if selected_stock:
                 with st.spinner(f"Loading chart for {selected_stock}..."):
@@ -483,21 +847,29 @@ def render_portfolio_tracker():
                         chart_data = add_technical_indicators(chart_data)
                 
                 if not chart_data.empty:
-                    # Get stock info for display
                     stock_row = df_holdings[df_holdings['Stock'] == selected_stock].iloc[0]
                     
-                    # Metrics row
+                    # --- ADVANCED ANALYSIS: Support/Resistance & Patterns ---
+                    sr_levels = None
+                    pattern_result = None
+                    
+                    if "Support/Resistance Zones" in show_advanced:
+                        sr_detector = SupportResistanceDetector(window=5, tolerance_pct=1.5, min_touches=2)
+                        sr_levels = sr_detector.get_nearest_levels(chart_data, n_levels=3)
+                    
+                    if "Pattern Recognition" in show_advanced:
+                        pattern_detector = PatternRecognizer(window=5, tolerance_pct=3.0)
+                        pattern_result = pattern_detector.detect_pattern(chart_data)
+                    
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Current Price", f"PKR {stock_row['Current Price']:,.2f}")
                     m2.metric("Avg Cost", f"PKR {stock_row['Avg Cost']:,.2f}")
                     m3.metric("Quantity", f"{stock_row['Quantity']:.0f}")
                     m4.metric("Return", f"{stock_row['Return %']:.2f}%", delta=f"{stock_row['Gain/Loss']:,.0f}")
                     
-                    # Determine number of rows for subplots
                     num_indicator_rows = sum([1 for i in ["RSI", "MACD"] if i in show_indicators])
-                    total_rows = 2 + num_indicator_rows  # Price + Volume + indicators
-                    
-                    row_heights = [0.5] + [0.15] * (total_rows - 1)  # Price chart bigger
+                    total_rows = 2 + num_indicator_rows
+                    row_heights = [0.5] + [0.15] * (total_rows - 1)
                     
                     fig = make_subplots(
                         rows=total_rows, cols=1,
@@ -507,7 +879,6 @@ def render_portfolio_tracker():
                         subplot_titles=[f"{selected_stock} Price"] + [""] * (total_rows - 1)
                     )
                     
-                    # Row 1: Candlestick with MAs and Bollinger Bands
                     fig.add_trace(go.Candlestick(
                         x=chart_data['Date'],
                         open=chart_data['Open'],
@@ -517,7 +888,6 @@ def render_portfolio_tracker():
                         name='Price'
                     ), row=1, col=1)
                     
-                    # Moving Averages
                     fig.add_trace(go.Scatter(
                         x=chart_data['Date'], y=chart_data['MA20'],
                         mode='lines', name='20-Day MA',
@@ -530,7 +900,6 @@ def render_portfolio_tracker():
                         line=dict(color='blue', width=1)
                     ), row=1, col=1)
                     
-                    # Bollinger Bands
                     if "Bollinger Bands" in show_indicators:
                         fig.add_trace(go.Scatter(
                             x=chart_data['Date'], y=chart_data['BB_Upper'],
@@ -545,7 +914,34 @@ def render_portfolio_tracker():
                             fill='tonexty', fillcolor='rgba(128,128,128,0.1)'
                         ), row=1, col=1)
                     
-                    # Row 2: Volume
+                    # --- ADD SUPPORT/RESISTANCE ZONES TO CHART ---
+                    if sr_levels:
+                        # Add support lines (green, dashed)
+                        for i, sup in enumerate(sr_levels.get('support_levels', [])):
+                            opacity = 0.8 - (i * 0.2)
+                            fig.add_hline(
+                                y=sup['level'], 
+                                line_dash="dot", 
+                                line_color=f"rgba(0, 200, 0, {opacity})",
+                                line_width=2,
+                                annotation_text=f"S{i+1}: {sup['level']:.2f}",
+                                annotation_position="left",
+                                row=1, col=1
+                            )
+                        
+                        # Add resistance lines (red, dashed)
+                        for i, res in enumerate(sr_levels.get('resistance_levels', [])):
+                            opacity = 0.8 - (i * 0.2)
+                            fig.add_hline(
+                                y=res['level'], 
+                                line_dash="dot", 
+                                line_color=f"rgba(255, 0, 0, {opacity})",
+                                line_width=2,
+                                annotation_text=f"R{i+1}: {res['level']:.2f}",
+                                annotation_position="right",
+                                row=1, col=1
+                            )
+                    
                     colors = ['green' if chart_data['Close'].iloc[i] >= chart_data['Open'].iloc[i] else 'red' 
                               for i in range(len(chart_data))]
                     fig.add_trace(go.Bar(
@@ -555,21 +951,17 @@ def render_portfolio_tracker():
                     
                     current_row = 3
                     
-                    # RSI
                     if "RSI" in show_indicators:
                         fig.add_trace(go.Scatter(
                             x=chart_data['Date'], y=chart_data['RSI'],
                             mode='lines', name='RSI',
                             line=dict(color='purple', width=1)
                         ), row=current_row, col=1)
-                        
-                        # Overbought/Oversold lines
                         fig.add_hline(y=70, line_dash="dash", line_color="red", row=current_row, col=1)
                         fig.add_hline(y=30, line_dash="dash", line_color="green", row=current_row, col=1)
                         fig.update_yaxes(title_text="RSI", row=current_row, col=1)
                         current_row += 1
                     
-                    # MACD
                     if "MACD" in show_indicators:
                         fig.add_trace(go.Scatter(
                             x=chart_data['Date'], y=chart_data['MACD'],
@@ -583,7 +975,6 @@ def render_portfolio_tracker():
                             line=dict(color='orange', width=1)
                         ), row=current_row, col=1)
                         
-                        # MACD Histogram
                         colors_macd = ['green' if val >= 0 else 'red' for val in chart_data['MACD_Hist']]
                         fig.add_trace(go.Bar(
                             x=chart_data['Date'], y=chart_data['MACD_Hist'],
@@ -603,16 +994,272 @@ def render_portfolio_tracker():
                     
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    # RSI Interpretation
-                    if "RSI" in show_indicators and not chart_data['RSI'].isna().all():
-                        latest_rsi = chart_data['RSI'].iloc[-1]
-                        if latest_rsi > 70:
-                            st.warning(f"⚠️ RSI is {latest_rsi:.1f} - Stock may be **overbought**")
-                        elif latest_rsi < 30:
-                            st.success(f"✅ RSI is {latest_rsi:.1f} - Stock may be **oversold**")
-                        else:
-                            st.info(f"ℹ️ RSI is {latest_rsi:.1f} - Stock is in neutral zone")
+                    # --- ANALYSIS PANELS ---
+                    analysis_cols = st.columns(2)
                     
+                    # Left Column: Technical Indicator Interpretations
+                    with analysis_cols[0]:
+                        st.markdown("##### 📊 Technical Signals")
+                        if "RSI" in show_indicators and 'RSI' in chart_data.columns and not chart_data['RSI'].isna().all():
+                            latest_rsi = chart_data['RSI'].iloc[-1]
+                            if latest_rsi > 70:
+                                st.warning(f"⚠️ **RSI: {latest_rsi:.1f}** - Overbought")
+                                st.caption("Price has risen rapidly. May pull back soon. Consider taking profits or waiting before buying.")
+                            elif latest_rsi < 30:
+                                st.success(f"✅ **RSI: {latest_rsi:.1f}** - Oversold")
+                                st.caption("Price has fallen significantly. May bounce back. Could be a buying opportunity.")
+                            else:
+                                st.info(f"ℹ️ **RSI: {latest_rsi:.1f}** - Neutral Zone")
+                                st.caption("No extreme momentum. Price moving normally.")
+                        
+                        if "MACD" in show_indicators and 'MACD' in chart_data.columns:
+                            latest_macd = chart_data['MACD'].iloc[-1]
+                            latest_signal = chart_data['MACD_Signal'].iloc[-1]
+                            if latest_macd > latest_signal:
+                                st.success(f"📈 **MACD: Bullish Crossover**")
+                                st.caption(f"MACD ({latest_macd:.2f}) is above Signal ({latest_signal:.2f}). Upward momentum building.")
+                            else:
+                                st.error(f"📉 **MACD: Bearish Crossover**")
+                                st.caption(f"MACD ({latest_macd:.2f}) is below Signal ({latest_signal:.2f}). Downward momentum building.")
+                        
+                        if "Bollinger Bands" in show_indicators and 'BB_Upper' in chart_data.columns:
+                            latest_close = chart_data['Close'].iloc[-1]
+                            bb_upper = chart_data['BB_Upper'].iloc[-1]
+                            bb_lower = chart_data['BB_Lower'].iloc[-1]
+                            bb_middle = chart_data['MA20'].iloc[-1]
+                            
+                            if latest_close >= bb_upper * 0.98:
+                                st.warning(f"📈 **Bollinger: Near Upper Band**")
+                                st.caption("Price near upper band. May be stretched. Watch for pullback.")
+                            elif latest_close <= bb_lower * 1.02:
+                                st.success(f"📉 **Bollinger: Near Lower Band**")
+                                st.caption("Price near lower band. May be oversold. Watch for bounce.")
+                            else:
+                                st.info(f"ℹ️ **Bollinger: Mid-Range**")
+                                st.caption("Price trading within normal range.")
+                    
+                    # Right Column: Advanced Analysis
+                    with analysis_cols[1]:
+                        st.markdown("##### 🎯 Advanced Analysis")
+                        # Pattern Recognition Display with explanation
+                        if pattern_result and pattern_result.get('pattern'):
+                            signal = pattern_result.get('signal', '')
+                            pattern_name = pattern_result.get('pattern', '')
+                            
+                            # Pattern explanations
+                            pattern_explanations = {
+                                'Bullish Double Bottom': "📈 W-shaped pattern. Price fell twice to similar lows, then bounced. Suggests buyers are stepping in - price may go UP.",
+                                'Bearish Double Top': "📉 M-shaped pattern. Price rose twice to similar highs, then fell back. Suggests sellers are stepping in - price may go DOWN.",
+                                'Bullish Higher Highs and Higher Lows': "📈 Uptrend in progress. Each high is higher than the previous, showing strong buying pressure.",
+                                'Bearish Lower Highs and Lower Lows': "📉 Downtrend in progress. Each high is lower than the previous, showing strong selling pressure.",
+                                'Bullish Inverse Head and Shoulders': "📈 Three lows with middle being deepest. Strong reversal signal - price likely to go UP significantly.",
+                                'Bearish Head and Shoulders': "📉 Three highs with middle being highest. Strong reversal signal - price likely to go DOWN significantly."
+                            }
+                            
+                            if signal == 'bullish':
+                                st.success(f"🎯 **{pattern_name}**")
+                            else:
+                                st.warning(f"🎯 **{pattern_name}**")
+                            
+                            explanation = pattern_explanations.get(pattern_name, "Chart pattern detected that may signal a trend change.")
+                            st.caption(explanation)
+                        elif "Pattern Recognition" in show_advanced:
+                            st.info("ℹ️ No clear chart pattern detected")
+                            st.caption("No recognizable reversal or continuation pattern at current price levels.")
+                        
+                        # Support/Resistance Summary
+                        if sr_levels:
+                            st.markdown("##### 📊 Key Price Levels")
+                            sr_col1, sr_col2 = st.columns(2)
+                            with sr_col1:
+                                st.markdown("**🟢 Support (Buy Zones):**")
+                                if sr_levels.get('support_levels'):
+                                    for i, s in enumerate(sr_levels['support_levels']):
+                                        dist_pct = ((sr_levels['current_price'] - s['level']) / sr_levels['current_price']) * 100
+                                        st.write(f"S{i+1}: PKR {s['level']:,.2f}")
+                                        st.caption(f"{dist_pct:.1f}% below current price")
+                                else:
+                                    st.write("No clear support levels")
+                            with sr_col2:
+                                st.markdown("**🔴 Resistance (Sell Zones):**")
+                                if sr_levels.get('resistance_levels'):
+                                    for i, r in enumerate(sr_levels['resistance_levels']):
+                                        dist_pct = ((r['level'] - sr_levels['current_price']) / sr_levels['current_price']) * 100
+                                        st.write(f"R{i+1}: PKR {r['level']:,.2f}")
+                                        st.caption(f"{dist_pct:.1f}% above current price")
+                                else:
+                                    st.write("No clear resistance levels")
+                            
+                            st.caption("💡 **Tip**: Support levels are good entry points. Resistance levels are profit-taking zones.")
+                    
+                    # --- FORECASTING SECTION ---
+                    st.divider()
+                    st.markdown("### 🔮 AI Price Forecast")
+                    
+                    if not is_model_available():
+                        st.warning("⚠️ No forecasting models installed.")
+                        st.code('pip install "chronos-forecasting>=2.0"  # For Chronos-2\npip install toto-ts  # For Toto', language="bash")
+                        st.caption("Install at least one package and restart the app to enable AI-powered price forecasting.")
+                    else:
+                        with st.expander("📈 Generate Price Forecast (Click to expand)", expanded=False):
+                            # Get available models
+                            available_models = get_available_models()
+                            model_names = [m[0] for m in available_models]
+                            model_descriptions = {m[0]: m[1] for m in available_models}
+                            
+                            st.caption("Uses AI models to forecast future stock prices based on historical patterns.")
+                            
+                            # Model selection
+                            selected_model = st.selectbox(
+                                "Select AI Model",
+                                model_names,
+                                key=f"model_select_{selected_stock}",
+                                help="Choose the forecasting model"
+                            )
+                            st.caption(f"ℹ️ {model_descriptions.get(selected_model, '')}")
+                            
+                            # Fetch maximum historical data for forecasting
+                            with st.spinner("Loading maximum historical data..."):
+                                forecast_chart_data = get_stock_chart_data(selected_stock, period="max")
+                            
+                            available_days = len(forecast_chart_data) if not forecast_chart_data.empty else 0
+                            
+                            # Set max context based on model
+                            model_max_context = 4096 if selected_model == "Toto" else 8192
+                            
+                            fc_col1, fc_col2, fc_col3 = st.columns(3)
+                            with fc_col1:
+                                forecast_days = st.slider("Forecast Period (Days)", min_value=7, max_value=1024, value=30, key=f"forecast_days_{selected_stock}",
+                                                         help="Number of days to forecast (max 1024)")
+                            with fc_col2:
+                                max_context = min(available_days, model_max_context) if available_days > 100 else model_max_context
+                                context_days = st.slider("Historical Context (Days)", min_value=100, max_value=max_context, value=min(1024, max_context), key=f"context_days_{selected_stock}",
+                                                        help=f"More historical data = better predictions (max {model_max_context})")
+                            with fc_col3:
+                                st.info(f"📊 Available: {available_days} days")
+                            
+                            if st.button("🔮 Generate Forecast", key=f"forecast_btn_{selected_stock}", type="primary"):
+                                with st.spinner(f"🤖 {selected_model} is analyzing patterns and generating forecast..."):
+                                    forecast_result = forecast_stock_price(
+                                        forecast_chart_data,
+                                        prediction_length=forecast_days,
+                                        context_length=context_days,
+                                        model_name=selected_model
+                                    )
+                                
+                                if forecast_result.get('success'):
+                                    # Get summary
+                                    summary = get_forecast_summary(forecast_result)
+                                    
+                                    # Display summary metrics
+                                    if summary:
+                                        st.success(f"✅ Forecast generated successfully using {summary.get('model', selected_model)}!")
+                                        
+                                        sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
+                                        sum_col1.metric(
+                                            "Current Price", 
+                                            f"PKR {summary['current_price']:,.2f}"
+                                        )
+                                        sum_col2.metric(
+                                            f"Forecast ({summary['days_ahead']}d)", 
+                                            f"PKR {summary['forecast_end_price']:,.2f}",
+                                            delta=f"{summary['price_change_pct']:+.2f}%"
+                                        )
+                                        sum_col3.metric(
+                                            "Forecast Range",
+                                            f"{summary['forecast_low']:,.0f} - {summary['forecast_high']:,.0f}"
+                                        )
+                                        sum_col4.metric(
+                                            "Trend Signal",
+                                            f"{summary['trend_emoji']} {summary['trend']}"
+                                        )
+                                    
+                                    # Create forecast chart
+                                    fig_forecast = go.Figure()
+                                    
+                                    # Historical prices
+                                    fig_forecast.add_trace(go.Scatter(
+                                        x=chart_data['Date'],
+                                        y=chart_data['Close'],
+                                        mode='lines',
+                                        name='Historical Price',
+                                        line=dict(color='#2196F3', width=2)
+                                    ))
+                                    
+                                    # Forecast dates
+                                    forecast_dates = forecast_result['dates']
+                                    
+                                    # 90% confidence interval (outer band)
+                                    if forecast_result.get('lower_90') and forecast_result.get('upper_90'):
+                                        fig_forecast.add_trace(go.Scatter(
+                                            x=forecast_dates + forecast_dates[::-1],
+                                            y=forecast_result['upper_90'] + forecast_result['lower_90'][::-1],
+                                            fill='toself',
+                                            fillcolor='rgba(255, 165, 0, 0.1)',
+                                            line=dict(color='rgba(255,255,255,0)'),
+                                            name='90% Confidence',
+                                            showlegend=True
+                                        ))
+                                    
+                                    # 50% confidence interval (inner band)
+                                    if forecast_result.get('lower_50') and forecast_result.get('upper_50'):
+                                        fig_forecast.add_trace(go.Scatter(
+                                            x=forecast_dates + forecast_dates[::-1],
+                                            y=forecast_result['upper_50'] + forecast_result['lower_50'][::-1],
+                                            fill='toself',
+                                            fillcolor='rgba(255, 165, 0, 0.2)',
+                                            line=dict(color='rgba(255,255,255,0)'),
+                                            name='50% Confidence',
+                                            showlegend=True
+                                        ))
+                                    
+                                    # Median forecast line
+                                    fig_forecast.add_trace(go.Scatter(
+                                        x=forecast_dates,
+                                        y=forecast_result['median'],
+                                        mode='lines',
+                                        name='Forecast (Median)',
+                                        line=dict(color='#FF9800', width=2, dash='dash')
+                                    ))
+                                    
+                                    # Add vertical line at forecast start (without annotation to avoid Plotly bug)
+                                    fig_forecast.add_shape(
+                                        type="line",
+                                        x0=forecast_result['last_actual_date'],
+                                        x1=forecast_result['last_actual_date'],
+                                        y0=0,
+                                        y1=1,
+                                        yref="paper",
+                                        line=dict(color="gray", width=2, dash="dash")
+                                    )
+                                    # Add annotation separately
+                                    fig_forecast.add_annotation(
+                                        x=forecast_result['last_actual_date'],
+                                        y=1.05,
+                                        yref="paper",
+                                        text="Forecast Start",
+                                        showarrow=False,
+                                        font=dict(size=10, color="gray")
+                                    )
+                                    
+                                    fig_forecast.update_layout(
+                                        title=f"{selected_stock} - {forecast_days}-Day Price Forecast",
+                                        xaxis_title="Date",
+                                        yaxis_title="Price (PKR)",
+                                        template="plotly_white",
+                                        height=400,
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                        hovermode='x unified'
+                                    )
+                                    
+                                    st.plotly_chart(fig_forecast, use_container_width=True)
+                                    
+                                    # Disclaimer
+                                    st.caption("⚠️ **Disclaimer**: This forecast is generated by an AI model based on historical patterns. "
+                                              "It should NOT be used as the sole basis for investment decisions. Past performance does not guarantee future results. "
+                                              "Always do your own research and consider consulting a financial advisor.")
+                                else:
+                                    st.error(f"❌ {forecast_result.get('error', 'Unknown error occurred')}")
                 else:
                     st.warning(f"Could not fetch chart data for {selected_stock}. Yahoo Finance may not have data for this stock.")
         
@@ -623,7 +1270,6 @@ def render_portfolio_tracker():
             div_summary, total_div = pm.get_dividend_summary()
             
             if not div_summary.empty:
-                # Dividend metrics
                 dc1, dc2, dc3 = st.columns(3)
                 dc1.metric("Total Dividends Received", f"PKR {total_div:,.2f}")
                 dc2.metric("Stocks with Dividends", len(div_summary))
@@ -640,9 +1286,8 @@ def render_portfolio_tracker():
                     use_container_width=True
                 )
                 
-                # Dividend history
                 st.markdown("### Dividend History")
-                dividends = get_dividends()
+                dividends = get_dividends(user_id)
                 if not dividends.empty:
                     div_col1, div_col2 = st.columns([3, 1])
                     with div_col1:
@@ -657,7 +1302,7 @@ def render_portfolio_tracker():
                         del_div_id = st.number_input("Dividend ID to Delete", min_value=0, step=1, key="del_div")
                         if st.button("Delete Dividend", type="secondary"):
                             if del_div_id > 0:
-                                delete_dividend(del_div_id)
+                                delete_dividend(del_div_id, user_id)
                                 st.success(f"Deleted dividend {del_div_id}")
                                 time.sleep(1)
                                 st.rerun()
@@ -672,7 +1317,6 @@ def render_portfolio_tracker():
             realized_summary, total_realized, total_winners, total_losers = pm.get_realized_pnl_summary()
             
             if not realized_summary.empty:
-                # Realized P&L metrics
                 rc1, rc2, rc3, rc4 = st.columns(4)
                 rc1.metric("Total Realized P&L", f"PKR {total_realized:,.2f}",
                           delta_color="normal" if total_realized >= 0 else "inverse")
@@ -690,9 +1334,8 @@ def render_portfolio_tracker():
                     use_container_width=True
                 )
                 
-                # Detailed history
                 st.markdown("### Trade History")
-                realized_df = get_realized_pnl()
+                realized_df = get_realized_pnl(user_id)
                 if not realized_df.empty:
                     st.dataframe(
                         realized_df.style.format({
@@ -703,7 +1346,6 @@ def render_portfolio_tracker():
                         use_container_width=True
                     )
                 
-                # P&L Chart
                 if len(realized_summary) > 0:
                     fig_realized = px.bar(realized_summary, x='Stock', y='Realized P&L', 
                                           color='Realized P&L', color_continuous_scale='RdYlGn',
@@ -714,6 +1356,56 @@ def render_portfolio_tracker():
 
     else:
         st.info("No active holdings. Add a transaction to see your portfolio.")
+
+
+def _consolidate_transactions_across_pdfs(transactions: list) -> list:
+    """
+    Consolidate transactions of the same symbol and type across multiple PDFs.
+    Uses weighted average for price calculation.
+    """
+    from collections import defaultdict
+    
+    # Group by symbol and type
+    grouped = defaultdict(list)
+    for t in transactions:
+        key = (t.get('symbol', '').upper().strip(), t.get('type', 'BUY'))
+        grouped[key].append(t)
+    
+    consolidated = []
+    for (symbol, trans_type), trans_list in grouped.items():
+        if len(trans_list) == 1:
+            consolidated.append(trans_list[0])
+        else:
+            # Calculate weighted average price
+            total_qty = sum(t.get('quantity', 0) for t in trans_list)
+            total_amount = sum(t.get('quantity', 0) * t.get('price', 0) for t in trans_list)
+            total_fees = sum(t.get('fees', 0) for t in trans_list)
+            
+            avg_price = total_amount / total_qty if total_qty > 0 else 0
+            
+            # Use the earliest date
+            dates = [t.get('date') for t in trans_list if t.get('date')]
+            earliest_date = min(dates) if dates else datetime.today().strftime('%Y-%m-%d')
+            
+            # Combine source files
+            source_files = list(set(t.get('source_file', '') for t in trans_list))
+            source_str = ', '.join(source_files[:3])
+            if len(source_files) > 3:
+                source_str += f" (+{len(source_files) - 3} more)"
+            
+            consolidated.append({
+                'symbol': symbol,
+                'type': trans_type,
+                'quantity': total_qty,
+                'price': avg_price,
+                'amount': total_amount,
+                'fees': total_fees,
+                'date': earliest_date,
+                'source_file': source_str
+            })
+    
+    return consolidated
+
 
 # ================= STOCK EXPLORER (STANDALONE CHARTS FOR ALL STOCKS) =================
 def render_stock_explorer():
@@ -1018,6 +1710,144 @@ def render_stock_explorer():
                                 st.write(f"R{i+1}: PKR {r['level']:,.2f} ({dist_pct:.1f}% above)")
                         else:
                             st.write("No clear resistance levels")
+            
+            # --- FORECASTING SECTION FOR STOCK EXPLORER ---
+            st.divider()
+            st.markdown("### 🔮 AI Price Forecast")
+            
+            if not is_model_available():
+                st.warning("⚠️ No forecasting models installed.")
+                st.code('pip install "chronos-forecasting>=2.0"  # For Chronos-2\npip install toto-ts  # For Toto', language="bash")
+                st.caption("Install at least one package and restart the app to enable AI-powered price forecasting.")
+            else:
+                with st.expander("📈 Generate Price Forecast (Click to expand)", expanded=False):
+                    # Get available models
+                    available_models = get_available_models()
+                    model_names = [m[0] for m in available_models]
+                    model_descriptions = {m[0]: m[1] for m in available_models}
+                    
+                    st.caption("Uses AI models to forecast future stock prices based on historical patterns.")
+                    
+                    # Model selection
+                    selected_model = st.selectbox(
+                        "Select AI Model",
+                        model_names,
+                        key=f"explorer_model_select_{selected_stock}",
+                        help="Choose the forecasting model"
+                    )
+                    st.caption(f"ℹ️ {model_descriptions.get(selected_model, '')}")
+                    
+                    # Fetch maximum historical data for forecasting
+                    with st.spinner("Loading maximum historical data..."):
+                        forecast_chart_data = get_stock_chart_data(selected_stock, period="max")
+                    
+                    available_days = len(forecast_chart_data) if not forecast_chart_data.empty else 0
+                    
+                    # Set max context based on model
+                    model_max_context = 4096 if selected_model == "Toto" else 8192
+                    
+                    fc_col1, fc_col2, fc_col3 = st.columns(3)
+                    with fc_col1:
+                        forecast_days = st.slider("Forecast Period (Days)", min_value=7, max_value=1024, value=30, key=f"explorer_forecast_days_{selected_stock}",
+                                                 help="Number of days to forecast (max 1024)")
+                    with fc_col2:
+                        max_context = min(available_days, model_max_context) if available_days > 100 else model_max_context
+                        context_days = st.slider("Historical Context (Days)", min_value=100, max_value=max_context, value=min(1024, max_context), key=f"explorer_context_days_{selected_stock}",
+                                                help=f"More historical data = better predictions (max {model_max_context})")
+                    with fc_col3:
+                        st.info(f"📊 Available: {available_days} days")
+                    
+                    if st.button("🔮 Generate Forecast", key=f"explorer_forecast_btn_{selected_stock}", type="primary"):
+                        with st.spinner(f"🤖 {selected_model} is analyzing patterns and generating forecast..."):
+                            forecast_result = forecast_stock_price(
+                                forecast_chart_data,
+                                prediction_length=forecast_days,
+                                context_length=context_days,
+                                model_name=selected_model
+                            )
+                        
+                        if forecast_result.get('success'):
+                            summary = get_forecast_summary(forecast_result)
+                            
+                            if summary:
+                                st.success(f"✅ Forecast generated successfully using {summary.get('model', selected_model)}!")
+                                
+                                sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
+                                sum_col1.metric("Current Price", f"PKR {summary['current_price']:,.2f}")
+                                sum_col2.metric(
+                                    f"Forecast ({summary['days_ahead']}d)", 
+                                    f"PKR {summary['forecast_end_price']:,.2f}",
+                                    delta=f"{summary['price_change_pct']:+.2f}%"
+                                )
+                                sum_col3.metric("Forecast Range", f"{summary['forecast_low']:,.0f} - {summary['forecast_high']:,.0f}")
+                                sum_col4.metric("Trend Signal", f"{summary['trend_emoji']} {summary['trend']}")
+                            
+                            # Create forecast chart
+                            fig_forecast = go.Figure()
+                            
+                            fig_forecast.add_trace(go.Scatter(
+                                x=chart_data['Date'],
+                                y=chart_data['Close'],
+                                mode='lines',
+                                name='Historical Price',
+                                line=dict(color='#2196F3', width=2)
+                            ))
+                            
+                            forecast_dates = forecast_result['dates']
+                            
+                            if forecast_result.get('lower_90') and forecast_result.get('upper_90'):
+                                fig_forecast.add_trace(go.Scatter(
+                                    x=forecast_dates + forecast_dates[::-1],
+                                    y=forecast_result['upper_90'] + forecast_result['lower_90'][::-1],
+                                    fill='toself',
+                                    fillcolor='rgba(255, 165, 0, 0.1)',
+                                    line=dict(color='rgba(255,255,255,0)'),
+                                    name='90% Confidence',
+                                    showlegend=True
+                                ))
+                            
+                            if forecast_result.get('lower_50') and forecast_result.get('upper_50'):
+                                fig_forecast.add_trace(go.Scatter(
+                                    x=forecast_dates + forecast_dates[::-1],
+                                    y=forecast_result['upper_50'] + forecast_result['lower_50'][::-1],
+                                    fill='toself',
+                                    fillcolor='rgba(255, 165, 0, 0.2)',
+                                    line=dict(color='rgba(255,255,255,0)'),
+                                    name='50% Confidence',
+                                    showlegend=True
+                                ))
+                            
+                            fig_forecast.add_trace(go.Scatter(
+                                x=forecast_dates,
+                                y=forecast_result['median'],
+                                mode='lines',
+                                name='Forecast (Median)',
+                                line=dict(color='#FF9800', width=2, dash='dash')
+                            ))
+                            
+                            fig_forecast.add_vline(
+                                x=forecast_result['last_actual_date'],
+                                line_dash="dash",
+                                line_color="gray",
+                                annotation_text="Forecast Start"
+                            )
+                            
+                            fig_forecast.update_layout(
+                                title=f"{selected_stock} - {forecast_days}-Day Price Forecast",
+                                xaxis_title="Date",
+                                yaxis_title="Price (PKR)",
+                                template="plotly_white",
+                                height=400,
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                hovermode='x unified'
+                            )
+                            
+                            st.plotly_chart(fig_forecast, use_container_width=True)
+                            
+                            st.caption("⚠️ **Disclaimer**: This forecast is generated by an AI model based on historical patterns. "
+                                      "It should NOT be used as the sole basis for investment decisions. Past performance does not guarantee future results.")
+                        else:
+                            st.error(f"❌ {forecast_result.get('error', 'Unknown error occurred')}")
             
         else:
             st.warning(f"Could not fetch chart data for {selected_stock}. Yahoo Finance may not have data for this stock.")
