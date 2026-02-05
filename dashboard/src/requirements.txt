@@ -10,3 +10,4 @@ yfinance
 scipy
 pdfplumber
 plotly==6.5.2
+matplotlib
